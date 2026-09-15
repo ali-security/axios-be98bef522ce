@@ -1,25 +1,13 @@
 name: 'CodeQL'
 
 on:
-  push:
-    branches:
-      - '*'
-      - '*/*'
-      - '**'
-      - '!sponsors'
-  pull_request:
-    branches:
-      - '*'
-      - '*/*'
-      - '**'
-      - '!sponsors'
-  schedule:
-    - cron: '21 23 * * 5'
+  workflow_dispatch:
 
 jobs:
   analyze:
     name: Analyze
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       actions: read
       contents: read
