@@ -2,12 +2,16 @@
 
 import assert from "assert";
 import http from "http";
+import stream from "stream";
+import { EventEmitter } from "events";
 import axios from "../../../index.js";
 import utils from "../../../lib/utils.js";
 import mergeConfig from "../../../lib/core/mergeConfig.js";
 import defaults from "../../../lib/defaults/index.js";
 import AxiosHeaders from "../../../lib/core/AxiosHeaders.js";
 import httpAdapter from "../../../lib/adapters/http.js";
+import buildURL from "../../../lib/helpers/buildURL.js";
+import resolveConfig from "../../../lib/helpers/resolveConfig.js";
 
 const nodeMajorVersion = parseInt(process.versions.node.split('.')[0], 10);
 
@@ -63,6 +67,11 @@ describe("Prototype Pollution Protection", function () {
     delete Object.prototype.get;
     delete Object.prototype.set;
     delete Object.prototype.customNested;
+    delete Object.prototype.encode;
+    delete Object.prototype.serialize;
+    delete Object.prototype.Authorization;
+    delete Object.prototype[Symbol.iterator];
+    delete Object.prototype[Symbol.toStringTag];
   });
 
   describe("utils.merge", function () {
@@ -1502,6 +1511,828 @@ describe("Prototype Pollution Protection", function () {
       } finally {
         await stop(server);
       }
+    });
+  });
+
+  // GHSA-jqh4-m9w3-8hp9 (CVE-2026-67319): the previous rounds only guarded
+  // TOP-LEVEL config reads. Nested option objects (`auth.username`,
+  // `options.serialize`, `options.encode`) and the Symbol gadgets
+  // (`Object.prototype[Symbol.iterator]` / `[Symbol.toStringTag]`) were still
+  // resolved straight off the prototype chain. The fix introduces
+  // `utils.hasOwnInPrototypeChain` / `utils.getSafeProp` / `utils.isSafeIterable`
+  // and routes every remaining read through them.
+  describe("GHSA-jqh4-m9w3-8hp9 nested option and Symbol gadgets", function () {
+    // Defines the gadget as a non-enumerable, WRITABLE slot. Writable matters:
+    // several positive-path assertions assign the same key onto a fresh object
+    // (mergeConfig deep-copies a real `auth`, Node's URL parser assigns
+    // `username` on its internal context), which would throw on a read-only
+    // inherited slot regardless of whether the fix is present.
+    function pollute(key, value) {
+      Object.defineProperty(Object.prototype, key, {
+        value: value,
+        configurable: true,
+        writable: true
+      });
+    }
+
+    function startServer(handler) {
+      return new Promise(function (resolve) {
+        const srv = http.createServer(handler);
+        srv.listen(0, "127.0.0.1", function () {
+          resolve(srv);
+        });
+      });
+    }
+
+    function stopServer(srv) {
+      return new Promise(function (resolve) {
+        srv.close(function () {
+          resolve();
+        });
+      });
+    }
+
+    function headerValue(obj, name) {
+      const lower = name.toLowerCase();
+      const keys = Object.keys(obj);
+      for (let i = 0; i < keys.length; i++) {
+        if (keys[i].toLowerCase() === lower) {
+          return obj[keys[i]];
+        }
+      }
+      return undefined;
+    }
+
+    function adapterConfig(url, extra) {
+      const config = {
+        method: "get",
+        url: url,
+        headers: new AxiosHeaders(),
+        proxy: false,
+        maxRedirects: 0,
+        maxContentLength: -1,
+        maxBodyLength: -1,
+        timeout: 8000
+      };
+
+      if (extra) {
+        Object.keys(extra).forEach(function (key) {
+          config[key] = extra[key];
+        });
+      }
+
+      return config;
+    }
+
+    describe("utils.hasOwnInPrototypeChain / utils.getSafeProp", function () {
+      it("should honor own properties", function () {
+        const target = { encode: "own" };
+
+        assert.strictEqual(utils.hasOwnInPrototypeChain(target, "encode"), true);
+        assert.strictEqual(utils.getSafeProp(target, "encode"), "own");
+      });
+
+      it("should ignore properties injected onto Object.prototype", function () {
+        pollute("encode", "polluted");
+        pollute("serialize", "polluted");
+
+        const target = {};
+
+        // the unguarded read is fooled, the guarded one is not
+        assert.strictEqual(target.encode, "polluted");
+        assert.strictEqual(utils.hasOwnInPrototypeChain(target, "encode"), false);
+        assert.strictEqual(utils.getSafeProp(target, "encode"), undefined);
+        assert.strictEqual(utils.getSafeProp(target, "serialize"), undefined);
+      });
+
+      it("should honor properties inherited from a non-Object.prototype source", function () {
+        pollute("encode", "polluted");
+
+        const template = { encode: "from-template" };
+        const target = Object.create(template);
+
+        assert.strictEqual(utils.hasOwnInPrototypeChain(target, "encode"), true);
+        assert.strictEqual(utils.getSafeProp(target, "encode"), "from-template");
+      });
+
+      it("should honor accessors defined on a class prototype", function () {
+        pollute("serialize", function () {
+          return "polluted=1";
+        });
+
+        class Template {
+          get serialize() {
+            return "from-class";
+          }
+        }
+
+        const instance = new Template();
+
+        assert.strictEqual(utils.hasOwnInPrototypeChain(instance, "serialize"), true);
+        assert.strictEqual(utils.getSafeProp(instance, "serialize"), "from-class");
+      });
+
+      it("should treat null and undefined sources as absent", function () {
+        pollute("encode", "polluted");
+
+        assert.strictEqual(utils.hasOwnInPrototypeChain(null, "encode"), false);
+        assert.strictEqual(utils.hasOwnInPrototypeChain(undefined, "encode"), false);
+        assert.strictEqual(utils.getSafeProp(null, "encode"), undefined);
+        assert.strictEqual(utils.getSafeProp(undefined, "encode"), undefined);
+      });
+
+      it("should stop safe prototype-chain reads on cyclic Proxy prototypes", function () {
+        let calls = 0;
+        let proxy;
+        proxy = new Proxy(
+          {},
+          {
+            getPrototypeOf: function () {
+              calls += 1;
+              if (calls > 5) {
+                throw new Error("cycled");
+              }
+              return proxy;
+            }
+          }
+        );
+
+        assert.strictEqual(utils.hasOwnInPrototypeChain(proxy, "missing"), false);
+        assert.strictEqual(utils.getSafeProp(proxy, "missing"), undefined);
+        assert.ok(calls <= 2, "the chain walk must stop on a cycle, got " + calls + " hops");
+      });
+    });
+
+    describe("utils.isPlainObject symbol gadgets", function () {
+      it("should ignore inherited symbol properties when validating plain Object", function () {
+        Object.prototype[Symbol.iterator] = function* () {
+          yield ["x-injected", "yes"];
+        };
+        Object.prototype[Symbol.toStringTag] = "Custom";
+
+        try {
+          // unpatched: `!(toStringTag in val)` / `!(iterator in val)` both see
+          // the polluted symbols and demote a genuine plain object
+          assert.strictEqual(utils.isPlainObject({}), true);
+          assert.strictEqual(utils.isPlainObject([]), false);
+          assert.strictEqual(
+            utils.isPlainObject({
+              [Symbol.iterator]: function* () {
+                yield ["x-own", "yes"];
+              }
+            }),
+            false
+          );
+          assert.strictEqual(
+            utils.isPlainObject({
+              [Symbol.toStringTag]: "Custom"
+            }),
+            false
+          );
+        } finally {
+          delete Object.prototype[Symbol.iterator];
+          delete Object.prototype[Symbol.toStringTag];
+        }
+      });
+
+      it("should treat an object with a genuinely inherited iterator as non-plain", function () {
+        // Iterator inherited from a custom (non-Object.prototype) source: this is
+        // a real iterable, not prototype pollution, so it must not be plain.
+        const proto = Object.create(null);
+        proto[Symbol.iterator] = function* () {
+          yield ["x", "1"];
+        };
+
+        assert.strictEqual(utils.isPlainObject(Object.create(proto)), false);
+      });
+    });
+
+    describe("utils.isSafeIterable", function () {
+      it("should not read polluted Object.prototype iterator accessors", function () {
+        let accessed = false;
+
+        try {
+          Object.defineProperty(Object.prototype, Symbol.iterator, {
+            configurable: true,
+            get: function () {
+              accessed = true;
+              throw new Error("polluted iterator accessor");
+            }
+          });
+
+          assert.strictEqual(utils.isSafeIterable({}), false);
+          assert.strictEqual(accessed, false);
+        } finally {
+          delete Object.prototype[Symbol.iterator];
+        }
+      });
+
+      it("should still report genuine iterables as safe", function () {
+        assert.strictEqual(utils.isSafeIterable([]), true);
+        assert.strictEqual(utils.isSafeIterable(new Map([["a", "1"]])), true);
+        assert.strictEqual(
+          utils.isSafeIterable({
+            [Symbol.iterator]: function* () {
+              yield ["x", "1"];
+            }
+          }),
+          true
+        );
+        assert.strictEqual(utils.isSafeIterable({}), false);
+        assert.strictEqual(utils.isSafeIterable(null), false);
+
+        Object.prototype[Symbol.iterator] = function* () {
+          yield ["x-injected", "yes"];
+        };
+
+        try {
+          // the unguarded predicate is fooled by the gadget, the guarded one is not
+          assert.strictEqual(utils.isIterable({}), true);
+          assert.strictEqual(utils.isSafeIterable({}), false);
+          assert.strictEqual(utils.isSafeIterable([]), true);
+        } finally {
+          delete Object.prototype[Symbol.iterator];
+        }
+      });
+    });
+
+    describe("AxiosHeaders iterable sources", function () {
+      it("should not merge Object.prototype values into iterable headers", function () {
+        pollute("Authorization", "polluted");
+
+        try {
+          const headers = new AxiosHeaders(new Map([["Authorization", "real"]]));
+
+          // unpatched: the accumulator object inherits Authorization, so the
+          // polluted value is merged in ahead of the real one
+          assert.strictEqual(headers.get("authorization"), "real");
+        } finally {
+          delete Object.prototype.Authorization;
+        }
+      });
+
+      it("should support objects with an own iterator as a key-value source object", function () {
+        const headers = new AxiosHeaders();
+
+        headers.set({
+          *[Symbol.iterator]() {
+            yield ["x", "123"];
+          }
+        });
+
+        assert.strictEqual(headers.get("x"), "123");
+      });
+
+      it("should merge duplicate keys from an iterable source into an array", function () {
+        const headers = new AxiosHeaders([
+          ["x", "a"],
+          ["x", "b"]
+        ]);
+
+        assert.deepStrictEqual(headers.get("x"), ["a", "b"]);
+      });
+
+      it("should not use inherited Symbol.iterator as a key-value source object", function () {
+        try {
+          Object.prototype[Symbol.iterator] = function* () {
+            yield ["x-app", "changed"];
+            yield ["x-injected", "yes"];
+          };
+
+          const headers = new AxiosHeaders({
+            "x-app": "safe"
+          });
+
+          assert.strictEqual(headers.get("x-app"), "safe");
+          assert.strictEqual(headers.get("x-injected"), undefined);
+        } finally {
+          delete Object.prototype[Symbol.iterator];
+        }
+      });
+
+      it("should not read polluted Object.prototype Symbol.iterator accessors", function () {
+        let accessed = false;
+
+        try {
+          Object.defineProperty(Object.prototype, Symbol.iterator, {
+            configurable: true,
+            get: function () {
+              accessed = true;
+              throw new Error("polluted iterator accessor");
+            }
+          });
+
+          const headers = new AxiosHeaders({
+            "x-app": "safe"
+          });
+
+          assert.strictEqual(headers.get("x-app"), "safe");
+          assert.strictEqual(accessed, false);
+        } finally {
+          delete Object.prototype[Symbol.iterator];
+        }
+      });
+
+      it("should not consume an inherited Symbol.iterator for non-plain header sources", function () {
+        try {
+          Object.prototype[Symbol.iterator] = function* () {
+            yield ["x-injected", "yes"];
+            yield ["authorization", "Bearer CHANGED"];
+          };
+
+          // A class instance and an Object.create(...) object both have a direct
+          // prototype other than Object.prototype, yet their only iterator comes
+          // from the polluted Object.prototype - they must not be iterated.
+          class HeaderBag {
+            constructor() {
+              this["authorization"] = "Bearer VALID";
+            }
+          }
+
+          const fromClass = new AxiosHeaders(new HeaderBag());
+          assert.strictEqual(fromClass.get("x-injected"), undefined);
+          assert.notStrictEqual(fromClass.get("authorization"), "Bearer CHANGED");
+
+          const created = Object.create({ "x-app": "safe" });
+          created["authorization"] = "Bearer VALID";
+          const fromCreate = new AxiosHeaders(created);
+          assert.strictEqual(fromCreate.get("x-injected"), undefined);
+          assert.notStrictEqual(fromCreate.get("authorization"), "Bearer CHANGED");
+        } finally {
+          delete Object.prototype[Symbol.iterator];
+        }
+      });
+    });
+
+    describe("helpers::buildURL serializer options", function () {
+      it("should ignore inherited serializer options", function () {
+        let serializeInvoked = false;
+        let encodeInvoked = false;
+
+        pollute("serialize", function () {
+          serializeInvoked = true;
+          return "inherited=1";
+        });
+        pollute("encode", function () {
+          encodeInvoked = true;
+          return "inherited";
+        });
+
+        try {
+          assert.strictEqual(buildURL("/foo", { value: "a b" }, {}), "/foo?value=a+b");
+          assert.strictEqual(serializeInvoked, false);
+          assert.strictEqual(encodeInvoked, false);
+        } finally {
+          delete Object.prototype.serialize;
+          delete Object.prototype.encode;
+        }
+      });
+
+      it("should still honor own serializer and encode options", function () {
+        pollute("serialize", function () {
+          return "inherited=1";
+        });
+        pollute("encode", function () {
+          return "inherited";
+        });
+
+        try {
+          let shorthandCalled = false;
+          assert.strictEqual(
+            buildURL("/foo", { value: "a b" }, function () {
+              shorthandCalled = true;
+              return "own=1";
+            }),
+            "/foo?own=1"
+          );
+          assert.strictEqual(shorthandCalled, true);
+
+          assert.strictEqual(
+            buildURL("/foo", { value: "a b" }, {
+              serialize: function () {
+                return "own=2";
+              }
+            }),
+            "/foo?own=2"
+          );
+
+          let ownEncodeCalled = false;
+          assert.strictEqual(
+            buildURL("/foo", { value: "ab" }, {
+              encode: function (value) {
+                ownEncodeCalled = true;
+                return encodeURIComponent(value);
+              }
+            }),
+            "/foo?value=ab"
+          );
+          assert.strictEqual(ownEncodeCalled, true);
+        } finally {
+          delete Object.prototype.serialize;
+          delete Object.prototype.encode;
+        }
+      });
+    });
+
+    describe("helpers::resolveConfig nested gadgets", function () {
+      it("should ignore inherited nested auth fields", function () {
+        if (typeof btoa === "undefined") {
+          this.skip();
+          return;
+        }
+
+        pollute("username", "inherited-user");
+        pollute("password", "inherited-pass");
+
+        try {
+          const config = resolveConfig({
+            url: "/foo",
+            auth: {}
+          });
+
+          // unpatched: auth.username/auth.password resolve through the polluted
+          // Object.prototype and the attacker's credentials are sent out
+          assert.strictEqual(config.headers.get("Authorization"), "Basic Og==");
+        } finally {
+          delete Object.prototype.username;
+          delete Object.prototype.password;
+        }
+      });
+
+      it("should still honor own auth fields while Object.prototype is polluted", function () {
+        if (typeof btoa === "undefined") {
+          this.skip();
+          return;
+        }
+
+        pollute("username", "inherited-user");
+        pollute("password", "inherited-pass");
+
+        try {
+          const config = resolveConfig({
+            url: "/foo",
+            auth: { username: "real-user", password: "real-pass" }
+          });
+
+          assert.strictEqual(
+            config.headers.get("Authorization"),
+            "Basic " + btoa("real-user:real-pass")
+          );
+        } finally {
+          delete Object.prototype.username;
+          delete Object.prototype.password;
+        }
+      });
+
+      it("should ignore inherited nested serializer fields", function () {
+        let serializeInvoked = false;
+        let encodeInvoked = false;
+
+        pollute("serialize", function () {
+          serializeInvoked = true;
+          return "inherited=1";
+        });
+        pollute("encode", function () {
+          encodeInvoked = true;
+          return "inherited";
+        });
+
+        try {
+          const config = resolveConfig({
+            url: "/foo",
+            params: { value: "a b" },
+            paramsSerializer: {}
+          });
+
+          assert.strictEqual(config.url, "/foo?value=a+b");
+          assert.strictEqual(serializeInvoked, false);
+          assert.strictEqual(encodeInvoked, false);
+        } finally {
+          delete Object.prototype.serialize;
+          delete Object.prototype.encode;
+        }
+      });
+    });
+
+    describe("static api gadgets", function () {
+      it("should ignore inherited data for bodyless method helpers", async function () {
+        this.timeout(10000);
+
+        pollute("data", "inherited-body");
+
+        try {
+          const methods = ["delete", "get", "head", "options"];
+
+          for (let i = 0; i < methods.length; i++) {
+            const method = methods[i];
+            let seenData = "unset";
+
+            await axios[method]("/test", {
+              adapter: function (config) {
+                seenData = config.data;
+
+                return Promise.resolve({
+                  data: null,
+                  status: 200,
+                  statusText: "OK",
+                  headers: {},
+                  config: config,
+                  request: {}
+                });
+              }
+            });
+
+            // unpatched: `(config || {}).data` reads the polluted body and the
+            // bodyless helper silently ships an attacker-controlled payload
+            assert.strictEqual(seenData, undefined, "method " + method);
+          }
+        } finally {
+          delete Object.prototype.data;
+        }
+      });
+
+      it("should ignore inherited nested serializer fields in getUri", function () {
+        let serializeInvoked = false;
+
+        pollute("serialize", function () {
+          serializeInvoked = true;
+          return "inherited=1";
+        });
+
+        try {
+          assert.strictEqual(
+            axios.getUri({
+              url: "/foo",
+              params: { value: "a b" },
+              paramsSerializer: {}
+            }),
+            "/foo?value=a+b"
+          );
+          assert.strictEqual(serializeInvoked, false);
+        } finally {
+          delete Object.prototype.serialize;
+        }
+      });
+    });
+
+    describe("http adapter nested gadgets", function () {
+      it("should ignore inherited nested request option fields", async function () {
+        this.timeout(10000);
+
+        const server = await startServer(function (req, res) {
+          res.setHeader("Content-Type", "application/json");
+          res.end(
+            JSON.stringify({
+              authorization: req.headers.authorization,
+              url: req.url
+            })
+          );
+        });
+        const port = server.address().port;
+
+        pollute("username", "inherited-user");
+        pollute("password", "inherited-pass");
+        pollute("serialize", function () {
+          return "inherited=1";
+        });
+
+        try {
+          const response = await axios.get("http://127.0.0.1:" + port + "/demo", {
+            auth: {},
+            params: { value: "a b" },
+            paramsSerializer: {},
+            proxy: false
+          });
+
+          assert.deepStrictEqual(response.data, {
+            authorization: "Basic Og==",
+            url: "/demo?value=a+b"
+          });
+        } finally {
+          delete Object.prototype.username;
+          delete Object.prototype.password;
+          delete Object.prototype.serialize;
+          await stopServer(server);
+        }
+      });
+
+      it("should still honor own auth credentials while Object.prototype is polluted", async function () {
+        this.timeout(10000);
+
+        const server = await startServer(function (req, res) {
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ authorization: req.headers.authorization }));
+        });
+        const port = server.address().port;
+
+        pollute("username", "inherited-user");
+        pollute("password", "inherited-pass");
+
+        try {
+          const response = await axios.get("http://127.0.0.1:" + port + "/demo", {
+            auth: { username: "real-user", password: "real-pass" },
+            proxy: false
+          });
+
+          assert.strictEqual(
+            response.data.authorization,
+            "Basic " + Buffer.from("real-user:real-pass").toString("base64")
+          );
+        } finally {
+          delete Object.prototype.username;
+          delete Object.prototype.password;
+          await stopServer(server);
+        }
+      });
+
+      it("should ignore inherited proxy for a plain adapter config", async function () {
+        this.timeout(10000);
+
+        const proxyEnvKeys = [
+          "http_proxy",
+          "HTTP_PROXY",
+          "https_proxy",
+          "HTTPS_PROXY",
+          "no_proxy",
+          "NO_PROXY"
+        ];
+        const originalProxyEnv = Object.create(null);
+        let proxyHits = 0;
+        let targetHits = 0;
+
+        proxyEnvKeys.forEach(function (key) {
+          originalProxyEnv[key] = process.env[key];
+          delete process.env[key];
+        });
+
+        const proxy = await startServer(function (req, res) {
+          proxyHits += 1;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ via: "proxy", url: req.url }));
+        });
+        const target = await startServer(function (req, res) {
+          targetHits += 1;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ via: "target", url: req.url }));
+        });
+
+        pollute("proxy", {
+          protocol: "http",
+          host: "127.0.0.1",
+          port: proxy.address().port
+        });
+
+        try {
+          // the adapter receives a PLAIN object config (not the null-prototype
+          // config mergeConfig produces), so `config.proxy` would resolve
+          // through Object.prototype without the guarded read
+          const config = adapterConfig(
+            "http://127.0.0.1:" + target.address().port + "/direct"
+          );
+          delete config.proxy;
+
+          const response = await httpAdapter(config);
+
+          assert.strictEqual(proxyHits, 0, "attacker proxy must not be used");
+          assert.strictEqual(targetHits, 1);
+          assert.deepStrictEqual(JSON.parse(response.data), {
+            via: "target",
+            url: "/direct"
+          });
+        } finally {
+          delete Object.prototype.proxy;
+          proxyEnvKeys.forEach(function (key) {
+            if (originalProxyEnv[key] === undefined) {
+              delete process.env[key];
+            } else {
+              process.env[key] = originalProxyEnv[key];
+            }
+          });
+          await stopServer(target);
+          await stopServer(proxy);
+        }
+      });
+
+      it("should ignore inherited paramsSerializer for a plain adapter config", async function () {
+        this.timeout(10000);
+
+        let serializerInvoked = false;
+
+        const server = await startServer(function (req, res) {
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ url: req.url }));
+        });
+        const port = server.address().port;
+
+        pollute("paramsSerializer", function () {
+          serializerInvoked = true;
+          return "inherited=1";
+        });
+
+        try {
+          const response = await httpAdapter(
+            adapterConfig("http://127.0.0.1:" + port + "/direct", {
+              params: { value: "a b" }
+            })
+          );
+
+          assert.strictEqual(serializerInvoked, false);
+          assert.deepStrictEqual(JSON.parse(response.data), {
+            url: "/direct?value=a+b"
+          });
+        } finally {
+          delete Object.prototype.paramsSerializer;
+          await stopServer(server);
+        }
+      });
+
+      it("should ignore inherited maxContentLength for a plain adapter config", async function () {
+        this.timeout(10000);
+
+        const body = "0123456789";
+        const server = await startServer(function (req, res) {
+          res.setHeader("Content-Type", "text/plain");
+          res.end(body);
+        });
+        const port = server.address().port;
+
+        pollute("maxContentLength", 1);
+
+        try {
+          const config = adapterConfig("http://127.0.0.1:" + port + "/big");
+          delete config.maxContentLength;
+
+          // unpatched: `config.maxContentLength` resolves to the polluted 1 and
+          // the adapter rejects every response larger than a single byte
+          const response = await httpAdapter(config);
+
+          assert.strictEqual(response.data, body);
+        } finally {
+          delete Object.prototype.maxContentLength;
+          await stopServer(server);
+        }
+      });
+
+      it("should not use inherited Symbol.iterator for request or response headers", async function () {
+        this.timeout(10000);
+
+        let capturedHeaders;
+        const stubTransport = {
+          request: function (options, handleResponse) {
+            capturedHeaders = Object.assign({}, options.headers);
+            const req = new EventEmitter();
+            req.write = function () {
+              return true;
+            };
+            req.setTimeout = function () {};
+            req.destroy = function () {};
+            req.end = function () {
+              const res = new stream.Readable({
+                read: function () {}
+              });
+              res.statusCode = 200;
+              res.statusMessage = "OK";
+              res.headers = { "x-server": "real" };
+              res.rawHeaders = [];
+              res.req = req;
+              process.nextTick(function () {
+                handleResponse(res);
+                res.push(null);
+              });
+            };
+            return req;
+          }
+        };
+
+        try {
+          Object.prototype[Symbol.iterator] = function* () {
+            yield ["X-Injected", "yes"];
+            yield ["Authorization", "Bearer CHANGED"];
+          };
+
+          const response = await axios.get("http://stub.invalid/", {
+            headers: {
+              Authorization: "Bearer VALID_USER_TOKEN",
+              "X-App": "safe"
+            },
+            transport: stubTransport,
+            maxRedirects: 0,
+            proxy: false
+          });
+
+          assert.ok(capturedHeaders, "transport was not invoked");
+          assert.strictEqual(headerValue(capturedHeaders, "X-App"), "safe");
+          assert.strictEqual(
+            headerValue(capturedHeaders, "Authorization"),
+            "Bearer VALID_USER_TOKEN"
+          );
+          assert.strictEqual(headerValue(capturedHeaders, "X-Injected"), undefined);
+          assert.strictEqual(response.headers.get("x-server"), "real");
+          assert.strictEqual(response.headers.get("x-injected"), undefined);
+        } finally {
+          delete Object.prototype[Symbol.iterator];
+        }
+      });
     });
   });
 
